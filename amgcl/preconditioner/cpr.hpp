@@ -155,6 +155,92 @@ class cpr {
             return S->system_matrix();
         }
 
+        // New matrix values, same sparsity. The pressure-system transfers stay;
+        // the pressure preconditioner must have been built with allow_rebuild.
+        // The global stage is rebuilt from the values. first_scalar_pass only
+        // counts the pressure-matrix entries, so the columns are filled here
+        // the same way as the scalar init before the pressure system is updated.
+        template <class Matrix>
+        void reuse_values(
+                const Matrix &K,
+                const backend_params &bprm = backend_params()
+              )
+        {
+            typedef typename backend::row_iterator<build_matrix>::type row_iterator;
+            const int       B = prm.block_size;
+            const ptrdiff_t N = (prm.active_rows ? prm.active_rows : n);
+
+            auto K_ptr = std::make_shared<build_matrix>(K);
+            S = std::make_shared<SPrecond>(K_ptr, prm.sprecond, bprm);
+
+            np = N / B;
+            std::shared_ptr<build_matrix_p> fpp, App;
+            std::tie(fpp, App) = first_scalar_pass(K_ptr);
+
+#pragma omp parallel
+            {
+                std::vector<row_iterator> k;
+                k.reserve(B);
+
+#pragma omp for
+                for(ptrdiff_t ip = 0; ip < static_cast<ptrdiff_t>(np); ++ip) {
+                    ptrdiff_t ik = ip * B;
+                    ptrdiff_t head = App->ptr[ip];
+                    bool      done = true;
+                    ptrdiff_t cur_col = 0;
+
+                    value_type_p *d = &fpp->val[ik];
+
+                    k.clear();
+                    for(int i = 0; i < B; ++i) {
+                        k.push_back(backend::row_begin(*K_ptr, ik + i));
+
+                        if (k.back() && k.back().col() < N) {
+                            ptrdiff_t col = k.back().col() / B;
+                            if (done) {
+                                cur_col = col;
+                                done = false;
+                            } else {
+                                cur_col = std::min(cur_col, col);
+                            }
+                        }
+                    }
+
+                    while (!done) {
+                        ptrdiff_t    end = (cur_col + 1) * B;
+                        value_type_p app = 0;
+
+                        for(int i = 0; i < B; ++i) {
+                            for(; k[i] && k[i].col() < end; ++k[i]) {
+                                if (k[i].col() % B == 0)
+                                    app += d[i] * k[i].value();
+                            }
+                        }
+
+                        App->col[head] = cur_col;
+                        App->val[head] = app;
+                        ++head;
+
+                        done = true;
+                        for(int i = 0; i < B; ++i) {
+                            if (k[i] && k[i].col() < N) {
+                                ptrdiff_t col = k[i].col() / B;
+                                if (done) {
+                                    cur_col = col;
+                                    done = false;
+                                } else {
+                                    cur_col = std::min(cur_col, col);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Fpp = backend_type_p::copy_matrix(fpp, bprm);
+            P->rebuild(*App, bprm);
+        }
+
         template <class Matrix>
         void partial_update(
                 const Matrix &K,
